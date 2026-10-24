@@ -1,7 +1,31 @@
 import express from "express";
-import { dbconnect } from "../dbconnect";
+import { dbconnect, execute, queryRows } from "../dbconnect";
+import type { RowDataPacket } from "mysql2/promise";
 
 export const router = express.Router();
+
+type OrderRow = RowDataPacket & {
+  order_id: number;
+  customer_id: number;
+  qty: number;
+  delivery_fee: number | string;
+};
+
+type CustomerRow = RowDataPacket & {
+  customer_id: number;
+  name: string;
+  phone: string;
+  latitude: number | string;
+  longitude: number | string;
+};
+
+type MappedCustomer = {
+  customer_id: number;
+  name: string;
+  phone: string;
+  latitude: number;
+  longitude: number;
+};
 
 const MSU_CENTER: [number, number] = [16.2466557, 103.2517639];
 const MAX_SERVICE_RADIUS_KM = 3.0; // เงื่อนไขข้อ 3: รัศมีให้บริการไม่เกิน 3 กม.
@@ -660,32 +684,20 @@ router.get("/code/:jobCode", async (req, res) => {
     return;
   }
 
-  const { data: sheet, error: sheetError } = await dbconnect
-    .from("job_sheets")
-    .select("job_id, job_code, distance_km, duration_min, rider_pay")
-    .eq("job_code", jobCode)
-    .maybeSingle();
-
-  if (sheetError) {
-    res.status(500).json({ error: sheetError.message });
-    return;
-  }
+  const [sheet] = await queryRows(
+    "SELECT job_id, job_code, distance_km, duration_min, rider_pay FROM job_sheets WHERE job_code = ? LIMIT 1",
+    [jobCode],
+  );
 
   if (!sheet) {
     res.status(404).json({ error: "Job sheet not found" });
     return;
   }
 
-  const { data: stops, error: stopsError } = await dbconnect
-    .from("job_stops")
-    .select("order_id, stop_seq, distance_km")
-    .eq("job_id", sheet.job_id)
-    .order("stop_seq", { ascending: true });
-
-  if (stopsError) {
-    res.status(500).json({ error: stopsError.message });
-    return;
-  }
+  const stops = await queryRows(
+    "SELECT order_id, stop_seq, distance_km FROM job_stops WHERE job_id = ? ORDER BY stop_seq ASC",
+    [sheet.job_id],
+  );
 
   const jobStops = stops ?? [];
   const orderIds = jobStops.map((stop) => stop.order_id);
@@ -695,35 +707,25 @@ router.get("/code/:jobCode", async (req, res) => {
     customer_id: number;
     name: string;
     phone: string;
-    latitude: number;
-    longitude: number;
+    latitude: number | string;
+    longitude: number | string;
   }[] = [];
 
   if (orderIds.length > 0) {
-    const { data: orderRows, error: ordersError } = await dbconnect
-      .from("orders")
-      .select("order_id, customer_id, qty")
-      .in("order_id", orderIds);
-
-    if (ordersError) {
-      res.status(500).json({ error: ordersError.message });
-      return;
-    }
-    orders = orderRows ?? [];
+    const placeholders = orderIds.map(() => "?").join(", ");
+    orders = await queryRows<OrderRow>(
+      `SELECT order_id, customer_id, qty FROM orders WHERE order_id IN (${placeholders})`,
+      orderIds,
+    );
 
     const customerIds = [...new Set(orders.map((order) => order.customer_id))];
 
     if (customerIds.length > 0) {
-      const { data: customerRows, error: customersError } = await dbconnect
-        .from("customers")
-        .select("customer_id, name, phone, latitude, longitude")
-        .in("customer_id", customerIds);
-
-      if (customersError) {
-        res.status(500).json({ error: customersError.message });
-        return;
-      }
-      customers = customerRows ?? [];
+      const placeholders = customerIds.map(() => "?").join(", ");
+      customers = await queryRows<CustomerRow>(
+        `SELECT customer_id, name, phone, latitude, longitude FROM customers WHERE customer_id IN (${placeholders})`,
+        customerIds,
+      );
     }
   }
 
@@ -765,32 +767,18 @@ router.post("/calculate", async (req, res) => {
     const algoIndex =
       Number.isInteger(rawAlgo) && rawAlgo >= 0 ? rawAlgo % ALGO_COUNT : 0;
 
-    const { data: orderRows, error: ordersError } = await dbconnect
-      .from("orders")
-      .select("order_id, customer_id, delivery_fee, qty");
-
-    if (ordersError) {
-      res.status(500).json({ error: ordersError.message });
-      return;
-    }
-
-    const orders = orderRows ?? [];
+    const orders = await queryRows<OrderRow>(
+      "SELECT order_id, customer_id, delivery_fee, qty FROM orders",
+    );
     const customerIds = [...new Set(orders.map((order) => order.customer_id))];
-    let customerById = new Map();
+    let customerById = new Map<number, MappedCustomer>();
 
     if (customerIds.length > 0) {
-      const { data: customerRows, error: customersError } = await dbconnect
-        .from("customers")
-        .select("customer_id, name, phone, latitude, longitude")
-        .in("customer_id", customerIds);
-
-      if (customersError) {
-        res.status(500).json({ error: customersError.message });
-        return;
-      }
-
       customerById = new Map(
-        (customerRows ?? []).map((customer) => [
+        (await queryRows<CustomerRow>(
+          `SELECT customer_id, name, phone, latitude, longitude FROM customers WHERE customer_id IN (${customerIds.map(() => "?").join(", ")})`,
+          customerIds,
+        )).map((customer) => [
           customer.customer_id,
           {
             ...customer,
@@ -860,18 +848,11 @@ router.delete("/delete/:id", async (req, res) => {
     return;
   }
 
-  const { data, error } = await dbconnect
-    .from("job_stops")
-    .delete()
-    .eq("order_id", orderId)
-    .select("order_id");
-
-  if (error) {
-    const errorMessage = error?.message || "Unknown error";
-    res.status(500).json({ error: errorMessage });
-    return;
-  }
-
+  const data = await queryRows(
+    "SELECT order_id FROM job_stops WHERE order_id = ?",
+    [orderId],
+  );
+  await execute("DELETE FROM job_stops WHERE order_id = ?", [orderId]);
   res.json({ message: "Deleted successfully", data });
 });
 
@@ -911,109 +892,85 @@ router.post("/dispatch", async (req, res) => {
     return;
   }
 
-  const { error: stopsDeleteError } = await dbconnect
-    .from("job_stops")
-    .delete()
-    .not("job_id", "is", null);
+  const connection = await dbconnect.getConnection();
+  let riderData: { rider_id: number; rider_code: string }[] = [];
+  let jobSheetData: { job_id: number; job_code: string }[] = [];
+  const data: {
+    job_id: number;
+    order_id: number;
+    stop_seq: number;
+    distance_km: number;
+  }[] = [];
 
-  if (stopsDeleteError) {
-    res.status(500).json({ error: stopsDeleteError.message });
-    return;
-  }
+  try {
+    await connection.beginTransaction();
+    await connection.execute("DELETE FROM job_stops");
+    await connection.execute("DELETE FROM job_sheets");
+    await connection.execute("DELETE FROM riders");
 
-  const { error: sheetsDeleteError } = await dbconnect
-    .from("job_sheets")
-    .delete()
-    .not("job_id", "is", null);
-
-  if (sheetsDeleteError) {
-    res.status(500).json({ error: sheetsDeleteError.message });
-    return;
-  }
-
-  const { error: ridersDeleteError } = await dbconnect
-    .from("riders")
-    .delete()
-    .not("rider_id", "is", null);
-
-  if (ridersDeleteError) {
-    res.status(500).json({ error: ridersDeleteError.message });
-    return;
-  }
-
-  const riderRows = riders.map((rider: any) => ({
-    rider_code: rider.rider_code,
-    route_color: rider.route_color,
-    max_orders: rider.max_orders ?? 3,
-  }));
-
-  const { data: riderData, error: riderError } = await dbconnect
-    .from("riders")
-    .insert(riderRows)
-    .select("rider_id, rider_code");
-
-  if (riderError) {
-    res.status(500).json({ error: riderError.message || "Unknown error" });
-    return;
-  }
-
-  const riderIdsByCode = new Map(
-    (riderData || []).map((rider) => [rider.rider_code, rider.rider_id])
-  );
-  const jobSheetRows = jobSheets.map((jobSheet: any) => ({
-    job_code: jobSheet.job_code,
-    rider_id: riderIdsByCode.get(jobSheet.rider?.rider_code),
-    distance_km: jobSheet.distance_km,
-    duration_min: jobSheet.duration_min,
-    rider_pay: jobSheet.rider_pay,
-  }));
-
-  if (jobSheetRows.some((jobSheet) => !jobSheet.rider_id)) {
-    res.status(400).json({ error: "A job sheet references an unknown rider" });
-    return;
-  }
-
-  const { data: jobSheetData, error: jobSheetError } = await dbconnect
-    .from("job_sheets")
-    .insert(jobSheetRows)
-    .select("job_id, job_code");
-
-  if (jobSheetError) {
-    res.status(500).json({ error: jobSheetError.message || "Unknown error" });
-    return;
-  }
-
-  const jobIdsByCode = new Map(
-    (jobSheetData || []).map((jobSheet) => [jobSheet.job_code, jobSheet.job_id])
-  );
-  const rows = jobSheets.flatMap((jobSheet: any) =>
-    (jobSheet.stops || []).map((stop: any) => ({
-      job_id: jobIdsByCode.get(jobSheet.job_code),
-      order_id: stop.order_id,
-      stop_seq: stop.stop_seq,
-      distance_km: stop.distance_km,
-    }))
-  );
-
-  const { data, error } = await dbconnect
-    .from("job_stops")
-    .insert(rows)
-    .select();
-
-  if (error) {
-    const { error: cleanupError } = await dbconnect
-      .from("job_sheets")
-      .delete()
-      .in(
-        "job_id",
-        (jobSheetData || []).map((jobSheet) => jobSheet.job_id)
+    for (const rider of riders) {
+      const [result] = await connection.execute<import("mysql2/promise").ResultSetHeader>(
+        "INSERT INTO riders (rider_code, route_color, max_orders) VALUES (?, ?, ?)",
+        [rider.rider_code, rider.route_color, rider.max_orders ?? 3],
       );
-    res.status(500).json({
-      error: cleanupError
-        ? `${error.message}; additionally failed to remove newly-created job sheets: ${cleanupError.message}`
-        : error.message || "Unknown error",
-    });
-    return;
+      riderData.push({
+        rider_id: result.insertId,
+        rider_code: rider.rider_code,
+      });
+    }
+
+    const riderIdsByCode = new Map(
+      riderData.map((rider) => [rider.rider_code, rider.rider_id]),
+    );
+    const jobIdsByCode = new Map<string, number>();
+    for (const jobSheet of jobSheets) {
+      const riderId = riderIdsByCode.get(jobSheet.rider.rider_code);
+      if (riderId === undefined) {
+        res.status(400).json({ error: "A job sheet references an unknown rider" });
+        await connection.rollback();
+        return;
+      }
+
+      const [result] = await connection.execute<import("mysql2/promise").ResultSetHeader>(
+        "INSERT INTO job_sheets (job_code, rider_id, distance_km, duration_min, rider_pay) VALUES (?, ?, ?, ?, ?)",
+        [
+          jobSheet.job_code,
+          riderId,
+          jobSheet.distance_km,
+          jobSheet.duration_min,
+          jobSheet.rider_pay,
+        ],
+      );
+      const insertedSheet = { job_id: result.insertId, job_code: jobSheet.job_code };
+      jobSheetData.push(insertedSheet);
+      jobIdsByCode.set(jobSheet.job_code, result.insertId);
+    }
+
+    for (const jobSheet of jobSheets) {
+      const jobId = jobIdsByCode.get(jobSheet.job_code);
+      if (jobId === undefined) {
+        throw new Error(`Missing inserted job sheet for ${jobSheet.job_code}`);
+      }
+
+      for (const stop of jobSheet.stops) {
+        await connection.execute(
+          "INSERT INTO job_stops (job_id, order_id, stop_seq, distance_km) VALUES (?, ?, ?, ?)",
+          [jobId, stop.order_id, stop.stop_seq, stop.distance_km],
+        );
+        data.push({
+          job_id: jobId,
+          order_id: stop.order_id,
+          stop_seq: stop.stop_seq,
+          distance_km: stop.distance_km,
+        });
+      }
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
   }
 
   res.json({
