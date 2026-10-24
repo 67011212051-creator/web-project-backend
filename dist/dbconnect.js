@@ -8,11 +8,13 @@ exports.queryRows = queryRows;
 exports.execute = execute;
 require("dotenv/config");
 const node_fs_1 = require("node:fs");
+const node_path_1 = require("node:path");
 const promise_1 = __importDefault(require("mysql2/promise"));
 const password = process.env.MYSQL_PASSWORD;
-const sslCa = process.env.MYSQL_SSL_CA_PATH
-    ? (0, node_fs_1.readFileSync)(process.env.MYSQL_SSL_CA_PATH, "utf8")
-    : undefined;
+const sslCa = process.env.MYSQL_SSL_CA?.replace(/\\n/g, "\n") ||
+    (process.env.MYSQL_SSL_CA_PATH
+        ? (0, node_fs_1.readFileSync)((0, node_path_1.resolve)(process.cwd(), process.env.MYSQL_SSL_CA_PATH), "utf8")
+        : undefined);
 if (!password) {
     throw new Error("Missing MYSQL_PASSWORD in backend/.env");
 }
